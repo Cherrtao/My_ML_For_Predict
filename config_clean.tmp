@@ -1,0 +1,44 @@
+"""Global config: DB connection, time range, device/point mapping."""
+
+# PostgreSQL (TimescaleDB) connection
+POSTGRES_DSN = "postgresql+psycopg2://postgres:postgres@192.168.31.224:5432/HuaZhiBackUp"
+
+# Time range for this experiment (2025-10-23 ~ 2025-11-12, end exclusive)
+START_TS = "2025-10-23 00:00:00"
+END_TS = "2025-11-12 00:00:00"
+
+WORKSHOP = "ÂçéÊô∫ÂõõËΩ¶Èó?
+
+# Device/point config ‚Ä?please fill correct devids based on your tables
+DEVICE_CONFIG = {
+    "bf": {
+        # list of devids for BF machines‚Ä?power meters (fill actual integers)
+        "devids": [51295,51297,51299,51301,51303,51305,51307,51309,51311,51313,51315,51317,51319,51321,51323,51325,51327],
+        # candidate power points; code will sum those found
+        "power_points": ["ALL_power_1"],
+    },
+    "cold_fan": {
+        # devids for cold fan VFDs
+        "devids": [90001,90002],
+        "power_point": "OutPower",
+        "freq_point": "Freq",
+    },
+    "exhaust_fan": {
+        # devid for exhaust fan VFD
+        "devid": 89999,
+        "power_point": "vfd_power_pct",
+        "freq_point": "vfd_freq_hz",
+    },
+    "env": {
+        # devid for environment sensor
+        "devid": 90000,
+        "temp_point": "Temp",
+        "hum_point": "Aname",
+        "press_point": "Pression",
+    },
+    "main_meter": {
+        # devid for main meter
+        "devid": 90004,
+        "power_points": ["All-Power", "A-Power"],
+    },
+}
