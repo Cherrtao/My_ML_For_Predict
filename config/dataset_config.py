@@ -4,8 +4,20 @@
 POSTGRES_DSN = "postgresql+psycopg2://postgres:postgres@192.168.31.224:5432/HuaZhiBackUp"
 
 # Time range for this experiment (2025-10-23 ~ 2025-11-12, end exclusive)
-START_TS = "2025-10-23 00:00:00"
-END_TS = "2025-11-12 00:00:00"
+START_TS_1 = "2025-10-23 00:00:00"
+END_TS_1 = "2025-11-12 00:00:00"
+START_TS_2 = "2025-12-24 00:00:00"
+END_TS_2 = "2026-01-04 00:00:00"
+
+# Backward-compatible single-range aliases.
+START_TS = START_TS_1
+END_TS = END_TS_1
+
+# Multiple ranges to extract; end is exclusive for each tuple.
+TIME_RANGES = [
+    (START_TS_1, END_TS_1),
+    (START_TS_2, END_TS_2)
+]
 
 WORKSHOP = "Workshop4"
 

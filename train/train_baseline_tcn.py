@@ -1,14 +1,11 @@
-# train/train_baseline_lstm_single.py
+# train/train_baseline_tcn.py
 """
-单任务 Baseline LSTM 训练脚本（5min 主功率预测）
+TCN Baseline 训练脚本（单任务：5min 主功率预测）
 
-- 输入：GraphSequenceDataset 提供的 (X, y)
-  - X: (B, T_in, N, F_max)
-  - y: (B, 288)  -> 未来 24h 的 5min 主功率（已标准化）
-
-- 模型：只用 Main 节点的历史特征，LSTM 直接预测 y
-- 损失：标准化空间 MSE
-- 评估：同时给出反标准化后的 RMSE / MAE / MAPE
+- 输入：Main 节点的历史特征 (B, T_in, F_main)
+- 输出：未来 24h (288 步) 的 main_power（标准化空间）
+- 损失：标准化空间 SmoothL1（对异常点更稳）
+- 评估：额外计算还原到 kW 后的 RMSE 和 MAPE
 """
 
 from __future__ import annotations
@@ -18,26 +15,32 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-import matplotlib.pyplot as plt
 
 from config.dataset_config import TRAIN_CSV, VAL_CSV
 from config.model_config import NODE_INDEX, NODE_INPUT_DIMS
 from data.graph_dataset import GraphSequenceDataset, fit_scaler_from_csv
-from models.baseline_lstm import BaselineLSTM
+from models.baseline_tcn import BaselineTCN
 
 
 # ================== 超参数 ==================
 T_IN = 288          # 过去 24h（5min 粒度）
 T_OUT = 288         # 未来 24h（5min 序列）
-BATCH_SIZE = 32
 
-HIDDEN_DIM = 48
-NUM_LAYERS = 2
-DROPOUT = 0.2
+BATCH_SIZE = 32     # 稍小一点，让梯度更“平滑”
 
-LR = 5e-4           # 比 1e-3 小一档，更稳
+CHANNELS = 32       # 通道数
+NUM_LEVELS = 7      # 感受野 ~ 255 步
+DROPOUT = 0.2       # 适中正则
+
+# ⭐ 关键：降低基础学习率
+LR = 3e-4
 WEIGHT_DECAY = 5e-5
-NUM_EPOCHS = 20     # 多给一点训练轮数
+NUM_EPOCHS = 40     # 允许更长训练
+
+# 学习率衰减 & 早停（注意：和原来不一样）
+LR_DECAY_EPOCHS = (40, 60)   # 先在 3e-4 上跑久一点，再衰减
+LR_DECAY_GAMMA = 0.5
+PATIENCE = 20                 # 给更大的早停耐心
 
 
 def build_datasets(t_in: int, t_out: int):
@@ -66,7 +69,7 @@ def build_datasets(t_in: int, t_out: int):
 
 
 def train_one_epoch(
-    model: BaselineLSTM,
+    model: BaselineTCN,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
@@ -88,11 +91,11 @@ def train_one_epoch(
         X = X.to(device)
         y = y.to(device)
 
-        # 只取 Main 节点特征
-        X_main = X[:, :, main_idx, :main_dim]   # (B, T_in, main_dim)
+        # 取 Main 节点特征
+        X_main = X[:, :, main_idx, :main_dim]   # (B, T_in, F_main)
 
         optimizer.zero_grad()
-        y_hat = model(X_main)                  # (B, T_out)
+        y_hat = model(X_main)                   # (B, T_out)
 
         loss = criterion(y_hat, y)
         loss.backward()
@@ -108,33 +111,33 @@ def train_one_epoch(
 
 @torch.no_grad()
 def eval_one_epoch(
-    model: BaselineLSTM,
+    model: BaselineTCN,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
     scaler,
 ):
     """
-    验证集评估（单任务）：
+    验证集评估：
 
     返回：
       - mse_norm : 标准化空间 MSE
       - rmse_kw  : 反标准化后的 RMSE（kW）
-      - mae_kw   : 反标准化后的 MAE（kW）
       - mape     : 反标准化后的 MAPE（0~1）
     """
     model.eval()
     total_loss = 0.0
     n_samples = 0
 
-    total_se_kw = 0.0   # Σ e^2  (kW^2)
-    total_ae_kw = 0.0   # Σ |e|   (kW)
-    total_ape = 0.0     # Σ |e| / |y|
+    # 真实空间 RMSE / MAPE 累计
+    total_se_kw = 0.0  # Σ e^2 (kW^2)
+    total_ape = 0.0    # Σ |e| / |y|
     n_points = 0
 
     main_idx = NODE_INDEX["Main"]
     main_dim = NODE_INPUT_DIMS["Main"]
 
+    # 从 scaler 中取出 main_power 的 mean/std
     main_mean = float(scaler["mean"]["main_power"])
     main_std = float(scaler["std"]["main_power"])
 
@@ -151,28 +154,26 @@ def eval_one_epoch(
         total_loss += loss.item() * bs
         n_samples += bs
 
-        # ---- 反标准化到 kW，计算 RMSE / MAE / MAPE ----
-        true_y_kw = y * main_std + main_mean
-        pred_y_kw = y_hat * main_std + main_mean
+        # ===== 反标准化到 kW，计算 RMSE + MAPE =====
+        # y, y_hat 是标准化空间
+        true_y_kw = y * main_std + main_mean      # (B, T_out)
+        pred_y_kw = y_hat * main_std + main_mean  # (B, T_out)
 
         err_kw = pred_y_kw - true_y_kw
         se_kw = (err_kw ** 2)
-        ae_kw = err_kw.abs()
 
         total_se_kw += se_kw.sum().item()
-        total_ae_kw += ae_kw.sum().item()
         n_points += se_kw.numel()
 
         eps = 1e-3
-        ape = ae_kw / (true_y_kw.abs() + eps)
+        ape = err_kw.abs() / (true_y_kw.abs() + eps)
         total_ape += ape.sum().item()
 
     mse_norm = total_loss / max(n_samples, 1)
     rmse_kw = (total_se_kw / max(n_points, 1)) ** 0.5
-    mae_kw = total_ae_kw / max(n_points, 1)
     mape = total_ape / max(n_points, 1)
 
-    return mse_norm, rmse_kw, mae_kw, mape
+    return mse_norm, rmse_kw, mape
 
 
 def main():
@@ -202,71 +203,76 @@ def main():
     # ========= 2. 模型 / 损失 / 优化器 =========
     main_dim = NODE_INPUT_DIMS["Main"]
 
-    model = BaselineLSTM(
+    model = BaselineTCN(
         input_dim=main_dim,
-        hidden_dim=HIDDEN_DIM,
-        num_layers=NUM_LAYERS,
         out_len=T_OUT,
+        channels=CHANNELS,
+        num_levels=NUM_LEVELS,
+        kernel_size=3,
         dropout=DROPOUT,
     ).to(device)
 
     print(model)
 
-    criterion = nn.MSELoss()
+    # ⭐ 损失改为 SmoothL1Loss（对异常点更稳）
+    criterion = nn.SmoothL1Loss(beta=1.0)
+
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=LR,
         weight_decay=WEIGHT_DECAY,
     )
 
-    # ========= 3. 训练循环 =========
-    best_val_rmse = float("inf")
+    # ---- 学习率衰减 & 早停配置 ----
+    global LR_DECAY_EPOCHS, LR_DECAY_GAMMA, PATIENCE
+
+    best_val_mse = float("inf")
     best_state = None
+    best_epoch = 0
 
     train_mse_hist = []
     val_mse_hist = []
     val_rmse_hist = []
-    val_mae_hist = []
     val_mape_hist = []
 
     ckpt_dir = Path("checkpoints")
     ckpt_dir.mkdir(exist_ok=True)
 
     for epoch in range(1, NUM_EPOCHS + 1):
-        # 手动 LR 衰减：训练到一半 / 后期各压一次
-        if epoch in (20, 30):
+        # ---- 手动学习率衰减 ----
+        if epoch in LR_DECAY_EPOCHS:
             for g in optimizer.param_groups:
-                g["lr"] *= 0.3
+                g["lr"] *= LR_DECAY_GAMMA
             print(f"[LR] decayed to {optimizer.param_groups[0]['lr']:.1e}")
 
+        # ---- Train / Val ----
         train_mse = train_one_epoch(
             model, train_loader, optimizer, criterion, device
         )
-        val_mse, val_rmse_kw, val_mae_kw, val_mape = eval_one_epoch(
+        val_mse, val_rmse_kw, val_mape = eval_one_epoch(
             model, val_loader, criterion, device, scaler
         )
 
         train_mse_hist.append(train_mse)
         val_mse_hist.append(val_mse)
         val_rmse_hist.append(val_rmse_kw)
-        val_mae_hist.append(val_mae_kw)
         val_mape_hist.append(val_mape)
 
         print(
             f"[Epoch {epoch:02d}] "
             f"Train MSE={train_mse:.4f} | "
             f"Val MSE={val_mse:.4f}, "
-            f"Val RMSE={val_rmse_kw:.2f} kW, "
-            f"Val MAE={val_mae_kw:.2f} kW, "
-            f"Val MAPE={val_mape*100:.2f}%, "
-            f"LR={optimizer.param_groups[0]['lr']:.1e}"
+            f"Val RMSE={val_rmse_kw:.3f} kW, "
+            f"Val MAPE={val_mape*100:.2f}%"
         )
 
-        # 以 RMSE(kW) 作为主指标保存最优模型
-        if val_rmse_kw < best_val_rmse:
-            best_val_rmse = val_rmse_kw
+        # ---- 保存最优模型（按 Val MSE）----
+        if val_mse < best_val_mse:
+            best_val_mse = val_mse
+            best_epoch = epoch
             best_state = {k: v.cpu() for k, v in model.state_dict().items()}
-            save_path = ckpt_dir / "baseline_lstm_single_best.pt"
+
+            save_path = ckpt_dir / "baseline_tcn_best.pt"
             torch.save(
                 {
                     "model_state_dict": best_state,
@@ -275,8 +281,8 @@ def main():
                         "T_IN": T_IN,
                         "T_OUT": T_OUT,
                         "main_dim": main_dim,
-                        "hidden_dim": HIDDEN_DIM,
-                        "num_layers": NUM_LAYERS,
+                        "channels": CHANNELS,
+                        "num_levels": NUM_LEVELS,
                         "dropout": DROPOUT,
                     },
                 },
@@ -284,26 +290,15 @@ def main():
             )
             print(f"  -> New best model saved to {save_path}")
 
-    print("Training finished. Best Val RMSE (kW):", best_val_rmse)
+        # ---- 早停：val 连续 PATIENCE 轮没变好就停 ----
+        if epoch - best_epoch >= PATIENCE:
+            print(f"[EarlyStop] epoch={epoch}, best_epoch={best_epoch}")
+            break
 
-    # ========= 4. 画 loss 曲线（标准化 MSE） =========
-    epochs = range(1, NUM_EPOCHS + 1)
-    plt.figure(figsize=(8, 5))
-    plt.plot(epochs, train_mse_hist, "o-", label="Train MSE (norm)")
-    plt.plot(epochs, val_mse_hist, "s-", label="Val MSE (norm)")
-    plt.xlabel("Epoch")
-    plt.ylabel("MSE Loss (normalized)")
-    plt.title("Baseline LSTM (5min main_power)")
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.legend()
+    print("Training finished. Best Val MSE:", best_val_mse)
 
-    out_path = ckpt_dir / "baseline_lstm_single_loss_curve.png"
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"Loss curve saved to: {out_path}")
-    plt.close()
-
-    # 方便 notebook 画更多图
-    return train_mse_hist, val_mse_hist, val_rmse_hist, val_mae_hist, val_mape_hist
+    # ✅ 返回给 notebook 画曲线用
+    return train_mse_hist, val_mse_hist, val_rmse_hist, val_mape_hist
 
 
 if __name__ == "__main__":

@@ -12,9 +12,9 @@ def main():
     full_days = sorted(counts[counts == 288].index)  # 每天 288 条为完整日
     df_full = df[df["date"].isin(full_days)].copy()
 
-    train_days = full_days[:14]
-    val_days = full_days[14:17]
-    test_days = full_days[17:]
+    train_days = full_days[:25]
+    val_days = full_days[25:31]
+    test_days = full_days[31:]
 
     df_train = df_full[df_full["date"].isin(train_days)].drop(columns=["date"])
     df_val = df_full[df_full["date"].isin(val_days)].drop(columns=["date"])

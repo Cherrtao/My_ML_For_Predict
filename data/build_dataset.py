@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
-from config import START_TS, END_TS, DEVICE_CONFIG
+from config.dataset_config import START_TS, END_TS, DEVICE_CONFIG, TIME_RANGES
 from db.connection import get_engine
 
 SQL = text(
@@ -99,80 +99,92 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def main():
-    engine = get_engine()
-    # 诊断：检查各层 join 结果数量
-    with engine.connect() as conn:
-        diag_sqls = {
-            "cagg_range": text(
-                """
-                SELECT count(*) FROM public.cagg_measure_5min c
-                WHERE c.ts_5min >= :start_ts AND c.ts_5min < :end_ts
-                """
-            ),
-            "cagg_join_point": text(
-                """
-                SELECT count(*) FROM public.cagg_measure_5min c
-                JOIN public.dim_point p ON c.point_sk = p.point_sk
-                WHERE c.ts_5min >= :start_ts AND c.ts_5min < :end_ts
-                """
-            ),
-            "cagg_join_point_devname": text(
-                """
-                SELECT count(*) FROM public.cagg_measure_5min c
-                JOIN public.dim_point p ON c.point_sk = p.point_sk
-                JOIN public.dim_device d ON p.devname = d.devname
-                WHERE c.ts_5min >= :start_ts AND c.ts_5min < :end_ts
-                """
-            ),
-            "cagg_join_point_devid": text(
-                """
-                SELECT count(*) FROM public.cagg_measure_5min c
-                JOIN public.dim_point p ON c.point_sk = p.point_sk
-                JOIN public.dim_device d ON p.devid = d.devid
-                WHERE c.ts_5min >= :start_ts AND c.ts_5min < :end_ts
-                """
-            ),
-        }
-        params = {"start_ts": START_TS, "end_ts": END_TS}
-        for name, sql_stmt in diag_sqls.items():
-            try:
-                res = conn.execute(sql_stmt, params).fetchall()
-                print(f"[diag] {name}: {res}")
-            except Exception as e:
-                print(f"[diag] {name} failed: {e}")
+def get_time_ranges():
+    return TIME_RANGES if TIME_RANGES else [(START_TS, END_TS)]
 
-    # 读取长表
-    params = {"start_ts": START_TS, "end_ts": END_TS}
-    print("Executing SQL for long table:\n", SQL.text.strip(), "\nparams:", params)
+
+def run_diagnostics(conn, start_ts, end_ts) -> None:
+    diag_sqls = {
+        "cagg_range": text(
+            """
+            SELECT count(*) FROM public.cagg_measure_5min c
+            WHERE c.ts_5min >= :start_ts AND c.ts_5min < :end_ts
+            """
+        ),
+        "cagg_join_point": text(
+            """
+            SELECT count(*) FROM public.cagg_measure_5min c
+            JOIN public.dim_point p ON c.point_sk = p.point_sk
+            WHERE c.ts_5min >= :start_ts AND c.ts_5min < :end_ts
+            """
+        ),
+        "cagg_join_point_devname": text(
+            """
+            SELECT count(*) FROM public.cagg_measure_5min c
+            JOIN public.dim_point p ON c.point_sk = p.point_sk
+            JOIN public.dim_device d ON p.devname = d.devname
+            WHERE c.ts_5min >= :start_ts AND c.ts_5min < :end_ts
+            """
+        ),
+        "cagg_join_point_devid": text(
+            """
+            SELECT count(*) FROM public.cagg_measure_5min c
+            JOIN public.dim_point p ON c.point_sk = p.point_sk
+            JOIN public.dim_device d ON p.devid = d.devid
+            WHERE c.ts_5min >= :start_ts AND c.ts_5min < :end_ts
+            """
+        ),
+    }
+    params = {"start_ts": start_ts, "end_ts": end_ts}
+    for name, sql_stmt in diag_sqls.items():
+        try:
+            res = conn.execute(sql_stmt, params).fetchall()
+            print(f"[diag] {name} ({start_ts} ~ {end_ts}): {res}")
+        except Exception as e:
+            print(f"[diag] {name} failed ({start_ts} ~ {end_ts}): {e}")
+
+
+def load_range(engine, start_ts, end_ts) -> pd.DataFrame:
+    params = {"start_ts": start_ts, "end_ts": end_ts}
+    print("Executing SQL for long table:", SQL.text.strip(), "params:", params)
     df_long = pd.read_sql(SQL, engine, params=params)
-    # 去除时区，确保与 date_range 对齐
     df_long["ts_5min"] = pd.to_datetime(df_long["ts_5min"]).dt.tz_localize(None)
     print(f"Fetched rows: {len(df_long)}")
 
-    # 聚合为宽表
     wide = build_wide_df(df_long)
-
-    # 时间补齐
-    full_index = pd.date_range(start=START_TS, end=END_TS, freq="5min", inclusive="left")
+    full_index = pd.date_range(start=start_ts, end=end_ts, freq="5min", inclusive="left")
     wide = wide.set_index("ts_5min").reindex(full_index)
     wide.index.name = "ts_5min"
-
-    # 缺失值前后向填充
     wide = wide.ffill().bfill().reset_index()
 
-    # 如需按天再截取，可开启；默认保留整个 [START_TS, END_TS) 区间
-    # start_date = pd.to_datetime(START_TS).date()
-    # end_date = (pd.to_datetime(END_TS) - pd.Timedelta(days=1)).date()
+    # Optional day slicing per range.
+    # start_date = pd.to_datetime(start_ts).date()
+    # end_date = (pd.to_datetime(end_ts) - pd.Timedelta(days=1)).date()
     # wide["date"] = wide["ts_5min"].dt.date
     # mask = (wide["date"] >= start_date) & (wide["date"] <= end_date)
     # wide = wide.loc[mask].drop(columns=["date"])
 
-    # 时间特征
-    wide = add_time_features(wide)
+    return add_time_features(wide)
+
+
+
+def main():
+    engine = get_engine()
+    ranges = get_time_ranges()
+
+    with engine.connect() as conn:
+        for start_ts, end_ts in ranges:
+            run_diagnostics(conn, start_ts, end_ts)
+
+    wide_parts = [load_range(engine, start_ts, end_ts) for start_ts, end_ts in ranges]
+    if wide_parts:
+        wide = pd.concat(wide_parts, ignore_index=True).sort_values("ts_5min")
+    else:
+        wide = pd.DataFrame()
 
     wide.to_csv("workshop_5min_clean_all.csv", index=False)
     print("Saved: workshop_5min_clean_all.csv")
+
 
 
 if __name__ == "__main__":
