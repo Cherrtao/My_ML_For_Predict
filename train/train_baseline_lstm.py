@@ -37,7 +37,7 @@ DROPOUT = 0.2
 
 LR = 5e-4           # 比 1e-3 小一档，更稳
 WEIGHT_DECAY = 5e-5
-NUM_EPOCHS = 20     # 多给一点训练轮数
+NUM_EPOCHS = 30     # 多给一点训练轮数
 
 
 def build_datasets(t_in: int, t_out: int):
